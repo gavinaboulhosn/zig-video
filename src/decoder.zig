@@ -14,9 +14,9 @@ pub const VideoFrame = struct {
     width: c_int,
     height: c_int,
     format: PixelFormat,
-    data: [4][*]u8, // Up to 4 planes for different pixel formats
-    linesize: [4]c_int, // Stride for each plane
-    pts: i64, // Presentation timestamp
+    data: [*]u8,
+    linesize: c_int,
+    pts: i64,
 };
 
 pub const Frame = union(enum) {
@@ -28,11 +28,11 @@ pub const Decoder = struct {
     format_context: ?*c.AVFormatContext,
     video_codec_context: ?*c.AVCodecContext,
     video_stream_index: c_int,
-    video_stream: ?*c.AVStream,
     video_frame: ?*c.AVFrame,
     video_frame_rgb: ?*c.AVFrame,
     packet: c.AVPacket,
-    video_buffer: [*c]u8,
+    video_buffer: []u8,
+    sws_context: ?*c.SwsContext,
 
     const Self = @This();
 
@@ -42,17 +42,17 @@ pub const Decoder = struct {
             .format_context = null,
             .video_codec_context = null,
             .video_stream_index = -1,
-            .video_stream = null,
             .video_frame = null,
             .video_frame_rgb = null,
             .packet = undefined,
             .video_buffer = undefined,
+            .sws_context = null,
         };
 
-        // First we need to
         try self.openFile(path);
         try self.findStreams();
         try self.openCodec();
+        try self.setupConverter();
 
         return self;
     }
@@ -62,6 +62,8 @@ pub const Decoder = struct {
         c.avcodec_free_context(@ptrCast(&self.video_codec_context));
         c.av_frame_free(&self.video_frame);
         c.av_frame_free(&self.video_frame_rgb);
+        c.sws_freeContext(self.sws_context);
+        self.allocator.free(self.video_buffer);
     }
 
     pub fn decodeNextFrame(self: *Self) !?Frame {
@@ -90,31 +92,24 @@ pub const Decoder = struct {
             return error.VideoPacketDecodeFailed;
         }
 
-        const format = switch (self.video_codec_context.?.pix_fmt) {
-            c.AV_PIX_FMT_YUV420P => PixelFormat.YUV420P,
-            c.AV_PIX_FMT_RGB24 => PixelFormat.RGB24,
-            c.AV_PIX_FMT_YUVJ420P => PixelFormat.YUVJ420P,
-            else => {
-                std.debug.print("Unsupported pixel format: {s}\n", .{c.av_pix_fmt_desc_get(self.video_codec_context.?.pix_fmt).*.name});
-                return error.UnsupportedPixelFormat;
-            },
-        };
+        _ = c.sws_scale(
+            self.sws_context.?,
+            &self.video_frame.?.data[0],
+            &self.video_frame.?.linesize[0],
+            0,
+            self.video_codec_context.?.height,
+            &self.video_frame_rgb.?.data[0],
+            &self.video_frame_rgb.?.linesize[0],
+        );
 
-        var frame = VideoFrame{
+        return VideoFrame{
+            .data = self.video_frame_rgb.?.data[0],
+            .linesize = self.video_frame_rgb.?.linesize[0],
             .width = self.video_codec_context.?.width,
             .height = self.video_codec_context.?.height,
-            .pts = self.video_frame.?.pts,
-            .format = format,
-            .data = undefined,
-            .linesize = undefined,
+            .format = getPixelFormat(self.video_frame_rgb.?.format),
+            .pts = self.video_frame_rgb.?.pts,
         };
-
-        var i: usize = 0;
-        while (i < 4 and self.video_frame.?.data[i] != null) : (i += 1) {
-            frame.data[i] = self.video_frame.?.data[i];
-            frame.linesize[i] = self.video_frame.?.linesize[i];
-        }
-        return frame;
     }
 
     fn openFile(self: *Self, path: [:0]const u8) !void {
@@ -162,4 +157,42 @@ pub const Decoder = struct {
         self.video_frame = c.av_frame_alloc() orelse return error.BuyMoreRam;
         self.video_frame_rgb = c.av_frame_alloc() orelse return error.BuyMoreRam;
     }
+
+    fn setupConverter(self: *Self) !void {
+        const buf_size: usize = @intCast(self.video_codec_context.?.width * self.video_codec_context.?.height * 4);
+
+        self.video_buffer = try self.allocator.alloc(u8, buf_size);
+        errdefer self.allocator.free(self.video_buffer);
+
+        _ = c.av_image_fill_arrays(
+            &self.video_frame_rgb.?.data[0],
+            &self.video_frame_rgb.?.linesize[0],
+            self.video_buffer.ptr,
+            c.AV_PIX_FMT_RGB0,
+            self.video_codec_context.?.width,
+            self.video_codec_context.?.height,
+            1,
+        );
+        self.sws_context = c.sws_getContext(
+            self.video_codec_context.?.width,
+            self.video_codec_context.?.height,
+            self.video_codec_context.?.pix_fmt,
+            self.video_codec_context.?.width,
+            self.video_codec_context.?.height,
+            c.AV_PIX_FMT_RGB0,
+            c.SWS_BILINEAR,
+            null,
+            null,
+            null,
+        ) orelse return error.SwsContextCreationFailed;
+    }
 };
+
+fn getPixelFormat(pix_fmt: c.AVPixelFormat) PixelFormat {
+    return switch (pix_fmt) {
+        c.AV_PIX_FMT_YUV420P => PixelFormat.YUV420P,
+        c.AV_PIX_FMT_RGB24 => PixelFormat.RGB24,
+        c.AV_PIX_FMT_YUVJ420P => PixelFormat.YUVJ420P,
+        else => PixelFormat.RGB24,
+    };
+}
