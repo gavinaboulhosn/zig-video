@@ -31,7 +31,9 @@ pub fn init(allocator: Allocator, width: i32, height: i32, title: [:0]const u8) 
 }
 
 pub fn deinit(self: *Self) void {
-    raylib.unloadTexture(self.video_texture.?);
+    if (self.video_texture) |texture| {
+        raylib.unloadTexture(texture);
+    }
     raylib.closeWindow();
 }
 
@@ -43,7 +45,7 @@ pub fn shouldClose(self: *Self) bool {
 pub fn renderVideoFrame(self: *Self, frame: *const VideoFrame) !void {
     raylib.beginDrawing();
     defer raylib.endDrawing();
-    raylib.clearBackground(raylib.Color.white);
+    raylib.clearBackground(raylib.Color.blank);
 
     if (self.video_texture == null) {
         self.video_texture = raylib.loadTextureFromImage(raylib.Image{
@@ -98,9 +100,9 @@ pub fn renderVideoFrame(self: *Self, frame: *const VideoFrame) !void {
         },
         raylib.Rectangle{
             .x = dest_x,
-            .y = dest_y,
+            .y = dest_y + 36,
             .width = dest_width,
-            .height = dest_height,
+            .height = dest_height - 72,
         },
         raylib.Vector2{ .x = 0, .y = 0 },
         0,

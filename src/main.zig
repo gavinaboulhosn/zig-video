@@ -22,17 +22,23 @@ pub fn main() !void {
     var renderer = Renderer.init(allocator, WINDOW_WIDTH, WINDOW_HEIGHT, "Zig Video Player");
     defer renderer.deinit();
 
-    var total_frames: usize = 0;
+    var total_video_frames: usize = 0;
+    var total_audio_frames: usize = 0;
     while (!renderer.shouldClose()) {
         if (try decoder.decodeNextFrame()) |frame| {
             switch (frame) {
                 .video => |vframe| {
                     try renderer.renderVideoFrame(&vframe);
-                    total_frames += 1;
+                    total_video_frames += 1;
+                },
+                .audio => |aframe| {
+                    // TODO: Handle audio frames
+                    _ = aframe;
+                    total_audio_frames += 1;
                 },
             }
         } else {
-            std.debug.print("Finished decoding video frames: {d}\n", .{total_frames});
+            std.debug.print("Finished decoding {d} video frames and {d} audio frames\n", .{ total_video_frames, total_audio_frames });
             break;
         }
 

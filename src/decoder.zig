@@ -19,39 +19,43 @@ pub const VideoFrame = struct {
     pts: i64,
 };
 
+pub const AudioFrame = struct {};
+
 pub const Frame = union(enum) {
     video: VideoFrame,
+    audio: AudioFrame,
 };
 
 pub const Decoder = struct {
     allocator: Allocator,
-    format_context: ?*c.AVFormatContext,
-    video_codec_context: ?*c.AVCodecContext,
-    video_stream_index: c_int,
-    video_frame: ?*c.AVFrame,
-    video_frame_rgb: ?*c.AVFrame,
-    packet: c.AVPacket,
+    format_context: ?*c.AVFormatContext = null,
+    video_codec_context: *c.AVCodecContext = undefined,
+    video_stream_index: c_int = -1,
+    video_frame: ?*c.AVFrame = null,
+    video_frame_rgb: ?*c.AVFrame = null,
+    packet: *c.AVPacket,
     video_buffer: []u8,
-    sws_context: ?*c.SwsContext,
+    sws_context: ?*c.SwsContext = null,
+    audio_stream_index: c_int = -1,
+    audio_frame: ?*c.AVFrame = null,
+    audio_codec_context: *c.AVCodecContext = undefined,
 
     const Self = @This();
 
     pub fn init(allocator: Allocator, path: [:0]const u8) !Self {
         var self = Self{
             .allocator = allocator,
-            .format_context = null,
-            .video_codec_context = null,
-            .video_stream_index = -1,
-            .video_frame = null,
-            .video_frame_rgb = null,
-            .packet = undefined,
+            .packet = c.av_packet_alloc() orelse return error.BuyMoreRam,
             .video_buffer = undefined,
-            .sws_context = null,
+            .video_frame = c.av_frame_alloc() orelse return error.BuyMoreRam,
+            .video_frame_rgb = c.av_frame_alloc() orelse return error.BuyMoreRam,
+            // TODO: Can we just use the same frame for audio and video?
+            .audio_frame = c.av_frame_alloc() orelse return error.BuyMoreRam,
         };
 
         try self.openFile(path);
         try self.findStreams();
-        try self.openCodec();
+        try self.openCodecs();
         try self.setupConverter();
 
         return self;
@@ -62,17 +66,24 @@ pub const Decoder = struct {
         c.avcodec_free_context(@ptrCast(&self.video_codec_context));
         c.av_frame_free(&self.video_frame);
         c.av_frame_free(&self.video_frame_rgb);
+        c.av_packet_free(@ptrCast(&self.packet));
         c.sws_freeContext(self.sws_context);
         self.allocator.free(self.video_buffer);
     }
 
     pub fn decodeNextFrame(self: *Self) !?Frame {
-        while (c.av_read_frame(self.format_context, &self.packet) >= 0) {
-            defer c.av_packet_unref(&self.packet);
+        while (c.av_read_frame(self.format_context, self.packet) >= 0) {
+            defer c.av_packet_unref(self.packet);
 
             if (self.packet.stream_index == self.video_stream_index) {
                 if (try self.decodeVideoPacket()) |frame| {
                     return Frame{ .video = frame };
+                }
+            }
+
+            if (self.packet.stream_index == self.audio_stream_index) {
+                if (try self.decodeAudioPacket()) |frame| {
+                    return Frame{ .audio = frame };
                 }
             }
         }
@@ -80,7 +91,7 @@ pub const Decoder = struct {
     }
 
     fn decodeVideoPacket(self: *Self) !?VideoFrame {
-        var ret = c.avcodec_send_packet(self.video_codec_context, &self.packet);
+        var ret = c.avcodec_send_packet(self.video_codec_context, self.packet);
         if (ret < 0) {
             return error.VideoPacketDecodeFailed;
         }
@@ -97,7 +108,7 @@ pub const Decoder = struct {
             &self.video_frame.?.data[0],
             &self.video_frame.?.linesize[0],
             0,
-            self.video_codec_context.?.height,
+            self.video_codec_context.height,
             &self.video_frame_rgb.?.data[0],
             &self.video_frame_rgb.?.linesize[0],
         );
@@ -105,11 +116,28 @@ pub const Decoder = struct {
         return VideoFrame{
             .data = self.video_frame_rgb.?.data[0],
             .linesize = self.video_frame_rgb.?.linesize[0],
-            .width = self.video_codec_context.?.width,
-            .height = self.video_codec_context.?.height,
+            .width = self.video_codec_context.width,
+            .height = self.video_codec_context.height,
             .format = getPixelFormat(self.video_frame_rgb.?.format),
             .pts = self.video_frame_rgb.?.pts,
         };
+    }
+
+    fn decodeAudioPacket(self: *Self) !?AudioFrame {
+        var ret = c.avcodec_send_packet(self.audio_codec_context, self.packet);
+        if (ret < 0) {
+            std.log.err("Error sending audio packet {}\n", .{ret});
+            return error.AudioPacketDecodeFailed;
+        }
+
+        ret = c.avcodec_receive_frame(self.audio_codec_context, self.audio_frame);
+        if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) {
+            return null;
+        } else if (ret < 0) {
+            return error.AudioPacketDecodeFailed;
+        }
+
+        return AudioFrame{};
     }
 
     fn openFile(self: *Self, path: [:0]const u8) !void {
@@ -123,43 +151,44 @@ pub const Decoder = struct {
     }
 
     fn findStreams(self: *Self) !void {
-        var index: c_uint = 0;
-        while (index < self.format_context.?.nb_streams) : (index += 1) {
-            if (self.format_context.?.streams[index].*.codecpar.*.codec_type == c.AVMEDIA_TYPE_VIDEO) {
-                self.video_stream_index = @intCast(index);
-                break;
-            }
+        self.video_stream_index = c.av_find_best_stream(self.format_context, c.AVMEDIA_TYPE_VIDEO, -1, -1, null, 0);
+        self.audio_stream_index = c.av_find_best_stream(self.format_context, c.AVMEDIA_TYPE_AUDIO, -1, -1, null, 0);
+
+        if (self.video_stream_index < 0) {
+            return error.NoVideoStreamFound;
         }
 
-        if (self.video_stream_index == -1) {
-            return error.NoVideoStreamFound;
+        if (self.audio_stream_index < 0) {
+            return error.NoAudioStreamFound;
         }
     }
 
-    fn openCodec(self: *Self) !void {
-        const video_idx: usize = @intCast(self.video_stream_index);
-        const video_codec = c.avcodec_find_decoder(self.format_context.?.streams[video_idx].*.codecpar.*.codec_id);
-        if (video_codec == null) {
+    fn openCodecs(self: *Self) !void {
+        try self.openCodec(&self.video_codec_context, self.video_stream_index);
+        try self.openCodec(&self.audio_codec_context, self.audio_stream_index);
+    }
+
+    fn openCodec(self: *Self, codec_context: **c.AVCodecContext, stream_index: c_int) !void {
+        const stream_index_usize: usize = @intCast(stream_index);
+        const codec = c.avcodec_find_decoder(self.format_context.?.streams[stream_index_usize].*.codecpar.*.codec_id);
+        if (codec == null) {
             return error.OpenCodecError;
         }
 
-        self.video_codec_context = c.avcodec_alloc_context3(video_codec) orelse return error.OpenCodecError;
-        errdefer c.avcodec_free_context(@ptrCast(&self.video_codec_context));
+        codec_context.* = c.avcodec_alloc_context3(codec) orelse return error.OpenCodecError;
+        errdefer c.avcodec_free_context(@ptrCast(codec_context));
 
-        if (c.avcodec_parameters_to_context(self.video_codec_context, self.format_context.?.streams[video_idx].*.codecpar) < 0) {
+        if (c.avcodec_parameters_to_context(codec_context.*, self.format_context.?.streams[stream_index_usize].*.codecpar) < 0) {
             return error.OpenCodecError;
         }
 
-        if (c.avcodec_open2(self.video_codec_context, video_codec, null) < 0) {
+        if (c.avcodec_open2(codec_context.*, codec, null) < 0) {
             return error.OpenCodecError;
         }
-
-        self.video_frame = c.av_frame_alloc() orelse return error.BuyMoreRam;
-        self.video_frame_rgb = c.av_frame_alloc() orelse return error.BuyMoreRam;
     }
 
     fn setupConverter(self: *Self) !void {
-        const buf_size: usize = @intCast(self.video_codec_context.?.width * self.video_codec_context.?.height * 4);
+        const buf_size: usize = @intCast(self.video_codec_context.width * self.video_codec_context.height * 4);
 
         self.video_buffer = try self.allocator.alloc(u8, buf_size);
         errdefer self.allocator.free(self.video_buffer);
@@ -169,16 +198,16 @@ pub const Decoder = struct {
             &self.video_frame_rgb.?.linesize[0],
             self.video_buffer.ptr,
             c.AV_PIX_FMT_RGB0,
-            self.video_codec_context.?.width,
-            self.video_codec_context.?.height,
+            self.video_codec_context.width,
+            self.video_codec_context.height,
             1,
         );
         self.sws_context = c.sws_getContext(
-            self.video_codec_context.?.width,
-            self.video_codec_context.?.height,
-            self.video_codec_context.?.pix_fmt,
-            self.video_codec_context.?.width,
-            self.video_codec_context.?.height,
+            self.video_codec_context.width,
+            self.video_codec_context.height,
+            self.video_codec_context.pix_fmt,
+            self.video_codec_context.width,
+            self.video_codec_context.height,
             c.AV_PIX_FMT_RGB0,
             c.SWS_BILINEAR,
             null,
