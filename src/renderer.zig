@@ -49,7 +49,7 @@ pub fn renderVideoFrame(self: *Self, frame: *const VideoFrame) !void {
 
     if (self.video_texture == null) {
         self.video_texture = raylib.loadTextureFromImage(raylib.Image{
-            .data = frame.data,
+            .data = frame.data.ptr,
             .width = frame.width,
             .height = frame.height,
             .mipmaps = 1,
@@ -60,7 +60,7 @@ pub fn renderVideoFrame(self: *Self, frame: *const VideoFrame) !void {
             .RGB24 => {
                 raylib.updateTexture(
                     self.video_texture.?,
-                    frame.data,
+                    frame.data.ptr,
                 );
             },
             .YUV420P, .YUVJ420P => {

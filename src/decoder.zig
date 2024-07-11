@@ -3,6 +3,10 @@ const Allocator = std.mem.Allocator;
 
 const c = @import("c.zig");
 
+const pool = @import("pool.zig");
+const PacketPool = pool.PacketPool;
+const FramePool = pool.FramePool;
+
 pub const PixelFormat = enum {
     RGB24,
     YUV420P,
@@ -11,46 +15,64 @@ pub const PixelFormat = enum {
 };
 
 pub const VideoFrame = struct {
+    allocator: Allocator,
     width: c_int,
     height: c_int,
     format: PixelFormat,
-    data: [*]u8,
+    data: []u8,
     linesize: c_int,
     pts: i64,
+
+    pub fn deinit(self: *VideoFrame) void {
+        self.allocator.free(self.data);
+    }
 };
 
-pub const AudioFrame = struct {};
+pub const AudioFrame = struct {
+    num_channels: usize,
+    sample_rate: usize,
+    num_samples: usize,
+    sample_size: usize,
+    data: std.ArrayList([]const u8),
+    is_planar: bool,
+
+    pub fn deinit(self: *AudioFrame) void {
+        self.data.deinit();
+    }
+};
 
 pub const Frame = union(enum) {
     video: VideoFrame,
     audio: AudioFrame,
+
+    pub fn deinit(self: *Frame) void {
+        switch (self.*) {
+            .video => |*v| v.deinit(),
+            .audio => |*a| a.deinit(),
+        }
+    }
 };
 
 pub const Decoder = struct {
     allocator: Allocator,
     format_context: ?*c.AVFormatContext = null,
-    video_codec_context: *c.AVCodecContext = undefined,
-    video_stream_index: c_int = -1,
-    video_frame: ?*c.AVFrame = null,
-    video_frame_rgb: ?*c.AVFrame = null,
-    packet: *c.AVPacket,
-    video_buffer: []u8,
+    codec_contexts: std.ArrayList(*c.AVCodecContext),
     sws_context: ?*c.SwsContext = null,
-    audio_stream_index: c_int = -1,
-    audio_frame: ?*c.AVFrame = null,
-    audio_codec_context: *c.AVCodecContext = undefined,
+    video_stream_index: c_int,
+    audio_stream_index: c_int,
+    packet_pool: PacketPool,
+    frame_pool: FramePool,
 
     const Self = @This();
 
     pub fn init(allocator: Allocator, path: [:0]const u8) !Self {
         var self = Self{
             .allocator = allocator,
-            .packet = c.av_packet_alloc() orelse return error.BuyMoreRam,
-            .video_buffer = undefined,
-            .video_frame = c.av_frame_alloc() orelse return error.BuyMoreRam,
-            .video_frame_rgb = c.av_frame_alloc() orelse return error.BuyMoreRam,
-            // TODO: Can we just use the same frame for audio and video?
-            .audio_frame = c.av_frame_alloc() orelse return error.BuyMoreRam,
+            .codec_contexts = std.ArrayList(*c.AVCodecContext).init(allocator),
+            .packet_pool = try PacketPool.init(allocator, 100),
+            .frame_pool = try FramePool.init(allocator, 100),
+            .video_stream_index = -1,
+            .audio_stream_index = -1,
         };
 
         try self.openFile(path);
@@ -63,81 +85,156 @@ pub const Decoder = struct {
 
     pub fn deinit(self: *Self) void {
         c.avformat_close_input(@ptrCast(&self.format_context));
-        c.avcodec_free_context(@ptrCast(&self.video_codec_context));
-        c.av_frame_free(&self.video_frame);
-        c.av_frame_free(&self.video_frame_rgb);
-        c.av_packet_free(@ptrCast(&self.packet));
+        for (self.codec_contexts.items) |*codec_context| {
+            c.avcodec_free_context(@ptrCast(codec_context));
+        }
+        self.codec_contexts.deinit();
         c.sws_freeContext(self.sws_context);
-        self.allocator.free(self.video_buffer);
+        self.packet_pool.deinit();
+        self.frame_pool.deinit();
+    }
+
+    pub fn readPacket(self: *Self) !?*c.AVPacket {
+        const packet = self.packet_pool.acquire() orelse return error.PacketPoolExhausted;
+
+        const ret = c.av_read_frame(self.format_context, packet);
+
+        if (ret == c.AVERROR_EOF) {
+            std.debug.print("End of file\n", .{});
+            return null;
+        } else if (ret < 0) {
+            return error.PacketReadFailed;
+        }
+
+        return packet;
+    }
+
+    pub fn decodePacket(self: *Self, packet: *c.AVPacket) !?*c.AVFrame {
+        const codec_context = try self.getCodecContext(packet.stream_index);
+
+        if (c.avcodec_send_packet(codec_context, packet) < 0) {
+            return error.PacketDecodeFailed;
+        }
+
+        const frame = self.frame_pool.acquire() orelse return error.FramePoolExhausted;
+        errdefer self.frame_pool.release(frame) catch {
+            std.debug.print("Failed to release frame\n", .{});
+        };
+
+        const ret = c.avcodec_receive_frame(codec_context, frame);
+        if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) {
+            std.debug.print("No frame to decode\n", .{});
+            return null;
+        } else if (ret < 0) {
+            return error.PacketDecodeFailed;
+        }
+
+        return frame;
     }
 
     pub fn decodeNextFrame(self: *Self) !?Frame {
-        while (c.av_read_frame(self.format_context, self.packet) >= 0) {
-            defer c.av_packet_unref(self.packet);
+        while (true) {
+            const packet = try self.readPacket() orelse {
+                std.debug.print("No more packets ", .{});
+                break;
+            };
+            defer self.packet_pool.release(packet) catch {
+                std.debug.print("Failed to release packet\n", .{});
+            };
 
-            if (self.packet.stream_index == self.video_stream_index) {
-                if (try self.decodeVideoPacket()) |frame| {
-                    return Frame{ .video = frame };
+            const frame = try self.decodePacket(packet) orelse continue;
+            defer self.frame_pool.release(frame) catch {
+                std.debug.print("Failed to release frame\n", .{});
+            };
+
+            if (packet.stream_index == self.video_stream_index) {
+                std.debug.print("Processing video frame\n", .{});
+                if (try self.processVideoFrame(frame)) |video_frame| {
+                    return .{ .video = video_frame };
                 }
-            }
-
-            if (self.packet.stream_index == self.audio_stream_index) {
-                if (try self.decodeAudioPacket()) |frame| {
-                    return Frame{ .audio = frame };
+            } else if (packet.stream_index == self.audio_stream_index) {
+                std.debug.print("Processing audio frame\n", .{});
+                if (try self.processAudioFrame(frame)) |audio_frame| {
+                    return .{ .audio = audio_frame };
                 }
             }
         }
         return null;
     }
 
-    fn decodeVideoPacket(self: *Self) !?VideoFrame {
-        var ret = c.avcodec_send_packet(self.video_codec_context, self.packet);
-        if (ret < 0) {
-            return error.VideoPacketDecodeFailed;
+    fn processAudioFrame(self: *Self, frame: *c.AVFrame) !?AudioFrame {
+        const num_samples: usize = @intCast(frame.nb_samples);
+        const codec_context = try self.getCodecContext(self.audio_stream_index);
+        const num_channels: usize = @intCast(codec_context.ch_layout.nb_channels);
+        const bytes_per_sample: usize = @intCast(c.av_get_bytes_per_sample(codec_context.sample_fmt));
+
+        const is_planar = c.av_sample_fmt_is_planar(codec_context.sample_fmt) != 0;
+
+        var data = std.ArrayList([]const u8).init(self.allocator);
+
+        for (0..num_channels) |i| {
+            const channel_data = frame.data[i];
+            try data.append(channel_data[0 .. num_samples * bytes_per_sample]);
         }
 
-        ret = c.avcodec_receive_frame(self.video_codec_context, self.video_frame);
-        if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) {
-            return null;
-        } else if (ret < 0) {
-            return error.VideoPacketDecodeFailed;
-        }
-
-        _ = c.sws_scale(
-            self.sws_context.?,
-            &self.video_frame.?.data[0],
-            &self.video_frame.?.linesize[0],
-            0,
-            self.video_codec_context.height,
-            &self.video_frame_rgb.?.data[0],
-            &self.video_frame_rgb.?.linesize[0],
-        );
-
-        return VideoFrame{
-            .data = self.video_frame_rgb.?.data[0],
-            .linesize = self.video_frame_rgb.?.linesize[0],
-            .width = self.video_codec_context.width,
-            .height = self.video_codec_context.height,
-            .format = getPixelFormat(self.video_frame_rgb.?.format),
-            .pts = self.video_frame_rgb.?.pts,
+        return AudioFrame{
+            .num_channels = @intCast(codec_context.ch_layout.nb_channels),
+            .sample_rate = @intCast(codec_context.sample_rate),
+            .num_samples = @intCast(frame.nb_samples),
+            .data = data,
+            .is_planar = is_planar,
+            .sample_size = bytes_per_sample,
         };
     }
 
-    fn decodeAudioPacket(self: *Self) !?AudioFrame {
-        var ret = c.avcodec_send_packet(self.audio_codec_context, self.packet);
-        if (ret < 0) {
-            std.log.err("Error sending audio packet {}\n", .{ret});
-            return error.AudioPacketDecodeFailed;
+    fn processVideoFrame(self: *Self, frame: *c.AVFrame) !?VideoFrame {
+        const codec_context = try self.getCodecContext(self.video_stream_index);
+
+        var rgb_frame = self.frame_pool.acquire() orelse return error.FramePoolExhausted;
+        defer self.frame_pool.release(rgb_frame) catch {
+            std.debug.print("Failed to release frame\n", .{});
+        };
+        const buf_size: usize = @intCast(codec_context.width * codec_context.height * 4);
+
+        const rgb_buffer = try self.allocator.alloc(u8, buf_size);
+
+        _ = c.av_image_fill_arrays(
+            &rgb_frame.data[0],
+            &rgb_frame.linesize[0],
+            rgb_buffer.ptr,
+            c.AV_PIX_FMT_RGB0,
+            codec_context.width,
+            codec_context.height,
+            1,
+        );
+
+        _ = c.sws_scale(
+            self.sws_context.?,
+            &frame.data[0],
+            &frame.linesize[0],
+            0,
+            codec_context.height,
+            &rgb_frame.data[0],
+            &rgb_frame.linesize[0],
+        );
+
+        return VideoFrame{
+            .allocator = self.allocator,
+            .data = rgb_buffer,
+            .linesize = rgb_frame.linesize[0],
+            .width = codec_context.width,
+            .height = codec_context.height,
+            .format = getPixelFormat(rgb_frame.format),
+            .pts = rgb_frame.pts,
+        };
+    }
+
+    fn getCodecContext(self: *Self, stream_index: c_int) !*c.AVCodecContext {
+        if (stream_index < 0 or stream_index >= self.codec_contexts.items.len) {
+            return error.InvalidStreamIndex;
         }
 
-        ret = c.avcodec_receive_frame(self.audio_codec_context, self.audio_frame);
-        if (ret == c.AVERROR(c.EAGAIN) or ret == c.AVERROR_EOF) {
-            return null;
-        } else if (ret < 0) {
-            return error.AudioPacketDecodeFailed;
-        }
-
-        return AudioFrame{};
+        return self.codec_contexts.items[@intCast(stream_index)];
     }
 
     fn openFile(self: *Self, path: [:0]const u8) !void {
@@ -164,50 +261,32 @@ pub const Decoder = struct {
     }
 
     fn openCodecs(self: *Self) !void {
-        try self.openCodec(&self.video_codec_context, self.video_stream_index);
-        try self.openCodec(&self.audio_codec_context, self.audio_stream_index);
-    }
+        for (0..self.format_context.?.nb_streams) |i| {
+            const codec = c.avcodec_find_decoder(self.format_context.?.streams[i].*.codecpar.*.codec_id) orelse return error.OpenCodecError;
+            var codec_context = c.avcodec_alloc_context3(codec);
+            errdefer c.avcodec_free_context(&codec_context);
 
-    fn openCodec(self: *Self, codec_context: **c.AVCodecContext, stream_index: c_int) !void {
-        const stream_index_usize: usize = @intCast(stream_index);
-        const codec = c.avcodec_find_decoder(self.format_context.?.streams[stream_index_usize].*.codecpar.*.codec_id);
-        if (codec == null) {
-            return error.OpenCodecError;
-        }
+            if (c.avcodec_parameters_to_context(codec_context, self.format_context.?.streams[i].*.codecpar) < 0) {
+                return error.OpenCodecError;
+            }
 
-        codec_context.* = c.avcodec_alloc_context3(codec) orelse return error.OpenCodecError;
-        errdefer c.avcodec_free_context(@ptrCast(codec_context));
+            if (c.avcodec_open2(codec_context, codec, null) < 0) {
+                return error.OpenCodecError;
+            }
 
-        if (c.avcodec_parameters_to_context(codec_context.*, self.format_context.?.streams[stream_index_usize].*.codecpar) < 0) {
-            return error.OpenCodecError;
-        }
-
-        if (c.avcodec_open2(codec_context.*, codec, null) < 0) {
-            return error.OpenCodecError;
+            try self.codec_contexts.append(codec_context);
         }
     }
 
     fn setupConverter(self: *Self) !void {
-        const buf_size: usize = @intCast(self.video_codec_context.width * self.video_codec_context.height * 4);
+        const video_codec_context = try self.getCodecContext(self.video_stream_index);
 
-        self.video_buffer = try self.allocator.alloc(u8, buf_size);
-        errdefer self.allocator.free(self.video_buffer);
-
-        _ = c.av_image_fill_arrays(
-            &self.video_frame_rgb.?.data[0],
-            &self.video_frame_rgb.?.linesize[0],
-            self.video_buffer.ptr,
-            c.AV_PIX_FMT_RGB0,
-            self.video_codec_context.width,
-            self.video_codec_context.height,
-            1,
-        );
         self.sws_context = c.sws_getContext(
-            self.video_codec_context.width,
-            self.video_codec_context.height,
-            self.video_codec_context.pix_fmt,
-            self.video_codec_context.width,
-            self.video_codec_context.height,
+            video_codec_context.width,
+            video_codec_context.height,
+            video_codec_context.pix_fmt,
+            video_codec_context.width,
+            video_codec_context.height,
             c.AV_PIX_FMT_RGB0,
             c.SWS_BILINEAR,
             null,
