@@ -29,6 +29,7 @@ pub fn build(b: *std.Build) !void {
     exe.linkSystemLibrary2("libavcodec", .{ .use_pkg_config = .force });
     exe.linkSystemLibrary2("libavutil", .{ .use_pkg_config = .force });
     exe.linkSystemLibrary2("libswscale", .{ .use_pkg_config = .force });
+    exe.linkSystemLibrary2("libswresample", .{ .use_pkg_config = .force });
 
     exe.linkLibC();
     b.installArtifact(exe);

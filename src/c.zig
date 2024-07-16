@@ -4,4 +4,7 @@ pub usingnamespace @cImport({
     @cInclude("libavutil/avutil.h");
     @cInclude("libavutil/imgutils.h");
     @cInclude("libswscale/swscale.h");
+    @cInclude("libswresample/swresample.h");
+    @cInclude("libavutil/channel_layout.h");
+    @cInclude("libavutil/samplefmt.h");
 });

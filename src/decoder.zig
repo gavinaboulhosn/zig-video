@@ -7,21 +7,13 @@ const pool = @import("pool.zig");
 const PacketPool = pool.PacketPool;
 const FramePool = pool.FramePool;
 
-pub const PixelFormat = enum {
-    RGB24,
-    YUV420P,
-    // Similar to above, but full range (0-255) instead of 16-235
-    YUVJ420P,
-};
-
 pub const VideoFrame = struct {
     allocator: Allocator,
     width: c_int,
     height: c_int,
-    format: PixelFormat,
     data: []u8,
     linesize: c_int,
-    pts: i64,
+    pts: f64,
 
     pub fn deinit(self: *VideoFrame) void {
         self.allocator.free(self.data);
@@ -29,15 +21,20 @@ pub const VideoFrame = struct {
 };
 
 pub const AudioFrame = struct {
+    allocator: Allocator,
     num_channels: usize,
     sample_rate: usize,
     num_samples: usize,
     sample_size: usize,
-    data: std.ArrayList([]const u8),
-    is_planar: bool,
+    raw_data: []u8,
+    pts: f64,
 
     pub fn deinit(self: *AudioFrame) void {
-        self.data.deinit();
+        self.allocator.free(self.raw_data);
+    }
+
+    pub fn getSamples(self: *AudioFrame, channel: usize) []u8 {
+        return self.raw_data[channel * self.sample_size .. (channel + 1) * self.sample_size * self.num_samples];
     }
 };
 
@@ -51,13 +48,22 @@ pub const Frame = union(enum) {
             .audio => |*a| a.deinit(),
         }
     }
+
+    pub fn getPts(self: *Frame) f64 {
+        switch (self.*) {
+            .video => return self.video.pts,
+            .audio => return self.audio.pts,
+        }
+    }
 };
 
 pub const Decoder = struct {
     allocator: Allocator,
+    config: DecoderConfig,
     format_context: ?*c.AVFormatContext = null,
     codec_contexts: std.ArrayList(*c.AVCodecContext),
     sws_context: ?*c.SwsContext = null,
+    swr_context: ?*c.SwrContext = null,
     video_stream_index: c_int,
     audio_stream_index: c_int,
     packet_pool: PacketPool,
@@ -65,9 +71,28 @@ pub const Decoder = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, path: [:0]const u8) !Self {
+    pub const DecoderConfig = struct {
+        file_path: []const u8,
+
+        audio_sample_rate: u32 = 41000,
+        audio_sample_fmt: c.AVSampleFormat = c.AV_SAMPLE_FMT_FLT,
+        audio_ch_layout_mask: u64 = c.AV_CH_LAYOUT_STEREO,
+
+        pub fn getAudioChannelLayout(self: DecoderConfig) c.AVChannelLayout {
+            var ch_layout: c.AVChannelLayout = undefined;
+            _ = c.av_channel_layout_from_mask(&ch_layout, self.audio_ch_layout_mask);
+            return ch_layout;
+        }
+
+        pub fn getSampleSize(self: DecoderConfig) u32 {
+            return @intCast(c.av_get_bytes_per_sample(self.audio_sample_fmt));
+        }
+    };
+
+    pub fn init(allocator: Allocator, config: DecoderConfig) !Self {
         var self = Self{
             .allocator = allocator,
+            .config = config,
             .codec_contexts = std.ArrayList(*c.AVCodecContext).init(allocator),
             .packet_pool = try PacketPool.init(allocator, 100),
             .frame_pool = try FramePool.init(allocator, 100),
@@ -75,10 +100,10 @@ pub const Decoder = struct {
             .audio_stream_index = -1,
         };
 
-        try self.openFile(path);
+        try self.openFile(config.file_path);
         try self.findStreams();
         try self.openCodecs();
-        try self.setupConverter();
+        try self.setupConverter(config);
 
         return self;
     }
@@ -90,8 +115,17 @@ pub const Decoder = struct {
         }
         self.codec_contexts.deinit();
         c.sws_freeContext(self.sws_context);
+        c.swr_free(&self.swr_context);
         self.packet_pool.deinit();
         self.frame_pool.deinit();
+    }
+
+    pub fn getAudioCodecContext(self: *Self) !*c.AVCodecContext {
+        return try self.getCodecContext(self.audio_stream_index);
+    }
+
+    pub fn getVideoCodecContext(self: *Self) !*c.AVCodecContext {
+        return try self.getCodecContext(self.video_stream_index);
     }
 
     pub fn readPacket(self: *Self) !?*c.AVPacket {
@@ -148,12 +182,10 @@ pub const Decoder = struct {
             };
 
             if (packet.stream_index == self.video_stream_index) {
-                std.debug.print("Processing video frame\n", .{});
                 if (try self.processVideoFrame(frame)) |video_frame| {
                     return .{ .video = video_frame };
                 }
             } else if (packet.stream_index == self.audio_stream_index) {
-                std.debug.print("Processing audio frame\n", .{});
                 if (try self.processAudioFrame(frame)) |audio_frame| {
                     return .{ .audio = audio_frame };
                 }
@@ -163,27 +195,106 @@ pub const Decoder = struct {
     }
 
     fn processAudioFrame(self: *Self, frame: *c.AVFrame) !?AudioFrame {
-        const num_samples: usize = @intCast(frame.nb_samples);
         const codec_context = try self.getCodecContext(self.audio_stream_index);
-        const num_channels: usize = @intCast(codec_context.ch_layout.nb_channels);
-        const bytes_per_sample: usize = @intCast(c.av_get_bytes_per_sample(codec_context.sample_fmt));
 
-        const is_planar = c.av_sample_fmt_is_planar(codec_context.sample_fmt) != 0;
+        const src_sample_rate = codec_context.sample_rate;
+        const src_nb_samples = frame.nb_samples;
 
-        var data = std.ArrayList([]const u8).init(self.allocator);
+        const dst_sample_fmt = self.config.audio_sample_fmt;
+        const dst_ch_layout = self.config.getAudioChannelLayout();
+        const dst_sample_rate = self.config.audio_sample_rate;
+        const max_dst_nb_samples = c.av_rescale_rnd(
+            src_nb_samples,
+            @intCast(dst_sample_rate),
+            src_sample_rate,
+            c.AV_ROUND_UP,
+        );
 
-        for (0..num_channels) |i| {
-            const channel_data = frame.data[i];
-            try data.append(channel_data[0 .. num_samples * bytes_per_sample]);
+        var dst_nb_samples: usize = @intCast(max_dst_nb_samples);
+        const dst_nb_channels = dst_ch_layout.nb_channels;
+        const dst_sample_size = self.config.getSampleSize();
+
+        var resampled_data: [*][*]u8 = undefined;
+        var dst_linesize: c_int = undefined;
+
+        var ret = c.av_samples_alloc_array_and_samples(
+            @ptrCast(&resampled_data),
+            &dst_linesize,
+            dst_nb_channels,
+            @intCast(dst_nb_samples),
+            dst_sample_fmt,
+            1,
+        );
+        defer c.av_freep(@ptrCast(&resampled_data[0]));
+        // defer c.av_freep(@ptrCast(&resampled_data));
+
+        if (ret < 0) {
+            return error.SampleAllocFailed;
         }
 
+        dst_nb_samples = @intCast(c.av_rescale_rnd(
+            c.swr_get_delay(self.swr_context, src_sample_rate) + src_nb_samples,
+            dst_sample_rate,
+            src_sample_rate,
+            c.AV_ROUND_UP,
+        ));
+
+        if (dst_nb_samples > max_dst_nb_samples) {
+            c.av_freep(@ptrCast(resampled_data[0]));
+            ret = c.av_samples_alloc(
+                @ptrCast(resampled_data),
+                &dst_linesize,
+                dst_nb_channels,
+                @intCast(dst_nb_samples),
+                dst_sample_fmt,
+                1,
+            );
+
+            if (ret < 0) {
+                return error.SampleAllocFailed;
+            }
+        }
+
+        ret = c.swr_convert(
+            self.swr_context,
+            resampled_data,
+            @intCast(dst_nb_samples),
+            frame.extended_data,
+            frame.nb_samples,
+        );
+
+        const resampled_data_size: usize = @intCast(c.av_samples_get_buffer_size(
+            &dst_linesize,
+            dst_nb_channels,
+            ret,
+            dst_sample_fmt,
+            1,
+        ));
+        const raw_data = try self.allocator.alloc(u8, resampled_data_size);
+        @memcpy(raw_data, resampled_data[0][0..resampled_data_size]);
+
+        const num_samples: usize = @intCast(ret);
+        const num_channels: usize = @intCast(dst_nb_channels);
+
+        const new_timebase = c.av_make_q(1, @intCast(dst_sample_rate));
+        const pts = c.av_rescale_q(
+            frame.pts,
+            codec_context.time_base,
+            new_timebase,
+        );
+
+        var pts_f: f64 = @floatFromInt(pts);
+        pts_f *= @floatFromInt(new_timebase.num);
+        pts_f /= @floatFromInt(new_timebase.den);
+
         return AudioFrame{
-            .num_channels = @intCast(codec_context.ch_layout.nb_channels),
-            .sample_rate = @intCast(codec_context.sample_rate),
-            .num_samples = @intCast(frame.nb_samples),
-            .data = data,
-            .is_planar = is_planar,
-            .sample_size = bytes_per_sample,
+            .allocator = self.allocator,
+            .num_channels = num_channels,
+            .sample_rate = @intCast(dst_sample_rate),
+            .num_samples = num_samples,
+            .raw_data = raw_data,
+            .sample_size = dst_sample_size,
+            .pts = pts_f,
         };
     }
 
@@ -218,14 +329,16 @@ pub const Decoder = struct {
             &rgb_frame.linesize[0],
         );
 
+        var pts_f: f64 = @floatFromInt(rgb_frame.pts);
+        pts_f *= @floatFromInt(codec_context.time_base.num);
+        pts_f /= @floatFromInt(codec_context.time_base.den);
         return VideoFrame{
             .allocator = self.allocator,
             .data = rgb_buffer,
             .linesize = rgb_frame.linesize[0],
             .width = codec_context.width,
             .height = codec_context.height,
-            .format = getPixelFormat(rgb_frame.format),
-            .pts = rgb_frame.pts,
+            .pts = pts_f,
         };
     }
 
@@ -237,8 +350,8 @@ pub const Decoder = struct {
         return self.codec_contexts.items[@intCast(stream_index)];
     }
 
-    fn openFile(self: *Self, path: [:0]const u8) !void {
-        if (c.avformat_open_input(&self.format_context, path, null, null) < 0) {
+    fn openFile(self: *Self, path: []const u8) !void {
+        if (c.avformat_open_input(&self.format_context, path.ptr, null, null) < 0) {
             return error.FileOpenError;
         }
 
@@ -278,29 +391,47 @@ pub const Decoder = struct {
         }
     }
 
-    fn setupConverter(self: *Self) !void {
-        const video_codec_context = try self.getCodecContext(self.video_stream_index);
+    fn setupConverter(self: *Self, config: DecoderConfig) !void {
+        const video_ctx = try self.getVideoCodecContext();
+        const audio_ctx = try self.getAudioCodecContext();
 
         self.sws_context = c.sws_getContext(
-            video_codec_context.width,
-            video_codec_context.height,
-            video_codec_context.pix_fmt,
-            video_codec_context.width,
-            video_codec_context.height,
+            video_ctx.width,
+            video_ctx.height,
+            video_ctx.pix_fmt,
+            video_ctx.width,
+            video_ctx.height,
             c.AV_PIX_FMT_RGB0,
             c.SWS_BILINEAR,
             null,
             null,
             null,
         ) orelse return error.SwsContextCreationFailed;
+        errdefer c.sws_freeContext(self.sws_context);
+
+        self.swr_context = c.swr_alloc() orelse return error.SwrContextCreationFailed;
+        errdefer c.swr_free(&self.swr_context);
+
+        var ch_layout = config.getAudioChannelLayout();
+        var ret = c.swr_alloc_set_opts2(
+            &self.swr_context,
+            &ch_layout,
+            config.audio_sample_fmt,
+            @intCast(config.audio_sample_rate),
+            &audio_ctx.ch_layout,
+            audio_ctx.sample_fmt,
+            audio_ctx.sample_rate,
+            0,
+            null,
+        );
+
+        if (ret < 0) {
+            return error.SwrContextInitFailed;
+        }
+
+        ret = c.swr_init(self.swr_context);
+        if (ret < 0) {
+            return error.SwrContextInitFailed;
+        }
     }
 };
-
-fn getPixelFormat(pix_fmt: c.AVPixelFormat) PixelFormat {
-    return switch (pix_fmt) {
-        c.AV_PIX_FMT_YUV420P => PixelFormat.YUV420P,
-        c.AV_PIX_FMT_RGB24 => PixelFormat.RGB24,
-        c.AV_PIX_FMT_YUVJ420P => PixelFormat.YUVJ420P,
-        else => PixelFormat.RGB24,
-    };
-}

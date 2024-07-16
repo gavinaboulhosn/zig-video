@@ -42,11 +42,7 @@ pub fn shouldClose(self: *Self) bool {
     return raylib.windowShouldClose();
 }
 
-pub fn renderVideoFrame(self: *Self, frame: *const VideoFrame) !void {
-    raylib.beginDrawing();
-    defer raylib.endDrawing();
-    raylib.clearBackground(raylib.Color.blank);
-
+pub fn update(self: *Self, frame: *const VideoFrame) void {
     if (self.video_texture == null) {
         self.video_texture = raylib.loadTextureFromImage(raylib.Image{
             .data = frame.data.ptr,
@@ -55,23 +51,19 @@ pub fn renderVideoFrame(self: *Self, frame: *const VideoFrame) !void {
             .mipmaps = 1,
             .format = raylib.PixelFormat.pixelformat_uncompressed_r8g8b8a8,
         });
-    } else {
-        switch (frame.format) {
-            .RGB24 => {
-                raylib.updateTexture(
-                    self.video_texture.?,
-                    frame.data.ptr,
-                );
-            },
-            .YUV420P, .YUVJ420P => {
-                std.debug.print("Got non RGB frame\n", .{});
-            },
-        }
+    }
+
+    raylib.updateTexture(self.video_texture.?, frame.data.ptr);
+}
+
+pub fn render(self: *Self) !void {
+    if (self.video_texture == null) {
+        return;
     }
     const window_width = @as(f32, @floatFromInt(raylib.getScreenWidth()));
     const window_height = @as(f32, @floatFromInt(raylib.getScreenHeight()));
-    const frame_width = @as(f32, @floatFromInt(frame.width));
-    const frame_height = @as(f32, @floatFromInt(frame.height));
+    const frame_width: f32 = @floatFromInt(self.video_texture.?.width);
+    const frame_height: f32 = @floatFromInt(self.video_texture.?.height);
 
     const window_aspect: f32 = window_width / window_height;
     const video_aspect: f32 = frame_width / frame_height;
