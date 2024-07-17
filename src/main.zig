@@ -4,11 +4,6 @@ const Allocator = std.mem.Allocator;
 const raylib = @import("raylib");
 const c = @import("c.zig");
 
-// const Decoder = @import("decoder.zig").Decoder;
-const dec = @import("decoder.zig");
-const Decoder = dec.Decoder;
-const Frame = dec.Frame;
-const Renderer = @import("renderer.zig");
 const Player = @import("player.zig").Player;
 
 const WINDOW_WIDTH = 800;
@@ -25,6 +20,8 @@ pub fn main() !void {
 
     var player = try Player.init(allocator, "./res/test.mp4");
     defer player.deinit();
+
+    try player.start();
 
     while (!player.renderer.shouldClose()) {
         try player.update();
