@@ -113,6 +113,8 @@ pub const Decoder = struct {
         try self.openCodecs();
         try self.setupConverter(config);
 
+        c.av_dump_format(self.format_context, 0, config.file_path.ptr, 0);
+
         return self;
     }
 
@@ -290,6 +292,7 @@ pub const Decoder = struct {
             @ptrCast(frame.extended_data),
             @intCast(src_nb_samples),
         );
+
         if (ret < 0) {
             return error.SampleConversionFailed;
         }
@@ -316,7 +319,7 @@ pub const Decoder = struct {
             null,
             0,
         );
-        std.debug.print("flushed samples: {}\n", .{ret});
+
         const time_base = stream.*.time_base;
 
         var pts_f: f64 = @floatFromInt(frame.pts);
@@ -334,7 +337,7 @@ pub const Decoder = struct {
     }
 
     fn processVideoFrame(self: *Self, frame: *c.AVFrame) !?VideoFrame {
-        const codec_context = try self.getCodecContext(self.video_stream_index);
+        const codec_context = try self.getVideoCodecContext();
         const stream = self.getVideoStream();
 
         var rgb_frame = self.frame_pool.acquire() orelse return error.FramePoolExhausted;
@@ -348,7 +351,7 @@ pub const Decoder = struct {
         const dst_height = codec_context.height;
         const dst_width = codec_context.width;
 
-        _ = c.av_image_fill_arrays(
+        var ret = c.av_image_fill_arrays(
             &rgb_frame.data[0],
             &rgb_frame.linesize[0],
             rgb_buffer.ptr,
@@ -358,7 +361,11 @@ pub const Decoder = struct {
             1,
         );
 
-        _ = c.sws_scale(
+        if (ret < 0) {
+            return error.ImageFillFailed;
+        }
+
+        ret = c.sws_scale(
             self.sws_context.?,
             &frame.data[0],
             &frame.linesize[0],
@@ -367,6 +374,10 @@ pub const Decoder = struct {
             &rgb_frame.data[0],
             &rgb_frame.linesize[0],
         );
+
+        if (ret < 0) {
+            return error.SwsScaleFailed;
+        }
 
         const time_base = stream.*.time_base;
 
@@ -434,7 +445,6 @@ pub const Decoder = struct {
 
     fn setupConverter(self: *Self, config: DecoderConfig) !void {
         const video_ctx = try self.getVideoCodecContext();
-        const audio_ctx = try self.getAudioCodecContext();
 
         self.sws_context = c.sws_getContext(
             video_ctx.width,
@@ -453,15 +463,18 @@ pub const Decoder = struct {
         self.swr_context = c.swr_alloc() orelse return error.SwrContextCreationFailed;
         errdefer c.swr_free(&self.swr_context);
 
+        // TODO: Handle audio or video only.
+        const audio_stream = self.getAudioStream();
+
         var ch_layout = config.getAudioChannelLayout();
         var ret = c.swr_alloc_set_opts2(
             &self.swr_context,
             &ch_layout,
             config.audio_sample_fmt,
             @intCast(config.audio_sample_rate),
-            &audio_ctx.ch_layout,
-            audio_ctx.sample_fmt,
-            audio_ctx.sample_rate,
+            &audio_stream.codecpar.*.ch_layout,
+            audio_stream.codecpar.*.format,
+            audio_stream.codecpar.*.sample_rate,
             0,
             null,
         );

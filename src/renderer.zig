@@ -24,7 +24,6 @@ pub fn init(allocator: Allocator, width: i32, height: i32, title: [:0]const u8) 
     };
 
     raylib.initWindow(width, height, title);
-    raylib.setTargetFPS(30);
     raylib.setWindowState(config);
 
     return self;

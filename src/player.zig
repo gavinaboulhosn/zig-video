@@ -16,6 +16,19 @@ pub const VideoQueue = Queue(VideoFrame);
 
 const Clock = @import("clock.zig").Clock;
 
+const MAX_AUDIO_BUFFER_SIZE = 4096;
+
+const AudioBuffer = std.fifo.LinearFifo(i16, .{ .Static = MAX_AUDIO_BUFFER_SIZE * 100 });
+var audio_buffer: AudioBuffer = AudioBuffer.init();
+
+// TODO: this is pretty much hard coded to work for 16 bit audio,
+// Raylib provides a simplified audio callback api compared to miniaudio, so we can't
+// pass a user data pointer to the callback, so we have to use a global variable
+fn audioCallback(any_buffer: ?*anyopaque, frames: u32) callconv(.C) void {
+    const buf = @as([*]i16, @ptrCast(@alignCast(any_buffer)))[0 .. frames * 2];
+    _ = audio_buffer.read(buf);
+}
+
 pub const Player = struct {
     allocator: Allocator,
     decoder: dec.Decoder,
@@ -44,7 +57,12 @@ pub const Player = struct {
             .file_path = file_path,
         };
 
-        const decoder = try dec.Decoder.init(allocator, decoder_config, audio_queue, video_queue);
+        const decoder = try dec.Decoder.init(
+            allocator,
+            decoder_config,
+            audio_queue,
+            video_queue,
+        );
 
         const renderer = Renderer.init(allocator, 800, 600, "Video Player");
 
@@ -56,6 +74,8 @@ pub const Player = struct {
             @intCast(channels),
         );
 
+        raylib.setAudioStreamBufferSizeDefault(MAX_AUDIO_BUFFER_SIZE);
+        raylib.setAudioStreamCallback(audio_stream, audioCallback);
         raylib.playAudioStream(audio_stream);
 
         const self = Self{
@@ -107,11 +127,8 @@ pub const Player = struct {
             var frame = try self.audio_queue.pop();
             defer frame.deinit();
 
-            if (raylib.isAudioStreamProcessed(self.audio_stream)) {
-                raylib.updateAudioStream(self.audio_stream, frame.raw_data.ptr, @intCast(frame.num_samples));
-            } else {
-                std.debug.print("Audio stream not processed\n", .{});
-            }
+            const buffer = std.mem.bytesAsSlice(i16, frame.raw_data);
+            try audio_buffer.write(@ptrCast(@alignCast(buffer)));
         }
 
         while (self.video_queue.peek()) |f| {
