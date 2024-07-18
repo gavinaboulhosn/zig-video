@@ -18,7 +18,7 @@ const Clock = @import("clock.zig").Clock;
 
 const MAX_AUDIO_BUFFER_SIZE = 4096;
 
-const AudioBuffer = std.fifo.LinearFifo(i16, .{ .Static = MAX_AUDIO_BUFFER_SIZE * 100 });
+const AudioBuffer = std.fifo.LinearFifo(i16, .{ .Static = MAX_AUDIO_BUFFER_SIZE * 10 });
 var audio_buffer: AudioBuffer = AudioBuffer.init();
 
 // TODO: this is pretty much hard coded to work for 16 bit audio,
@@ -95,10 +95,9 @@ pub const Player = struct {
 
     pub fn deinit(self: *Self) void {
         self.is_running.store(false, .release);
-        self.decode_thread.join();
-        self.decoder.deinit();
-        self.renderer.deinit();
-        raylib.unloadAudioStream(self.audio_stream);
+
+        // Free all remaining frames.  This also wakes up the decode thread
+        // if it was waiting on a conditon.
         while (self.audio_queue.peek()) |_| {
             var frame = self.audio_queue.pop() catch {};
             frame.deinit();
@@ -107,10 +106,15 @@ pub const Player = struct {
             var frame = self.video_queue.pop() catch {};
             frame.deinit();
         }
+
+        self.decode_thread.join();
+        self.decoder.deinit();
+        self.renderer.deinit();
         self.audio_queue.deinit();
         self.allocator.destroy(self.audio_queue);
         self.video_queue.deinit();
         self.allocator.destroy(self.video_queue);
+        raylib.unloadAudioStream(self.audio_stream);
     }
 
     pub fn start(self: *Self) !void {
@@ -119,6 +123,16 @@ pub const Player = struct {
 
     pub fn update(self: *Self) !void {
         const elapsed_time = self.clock.getTime();
+
+        if (raylib.isKeyPressed(raylib.KeyboardKey.key_space)) {
+            if (raylib.isAudioStreamPlaying(self.audio_stream)) {
+                raylib.pauseAudioStream(self.audio_stream);
+                self.clock.pause();
+            } else {
+                raylib.resumeAudioStream(self.audio_stream);
+                self.clock.unpause();
+            }
+        }
 
         while (self.audio_queue.peek()) |f| {
             if (f.pts > elapsed_time) {

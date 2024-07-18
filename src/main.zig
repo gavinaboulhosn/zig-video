@@ -30,7 +30,7 @@ pub fn main() !void {
 
         raylib.beginDrawing();
         defer raylib.endDrawing();
-        raylib.clearBackground(raylib.Color.white);
+        raylib.clearBackground(raylib.Color.black);
 
         try player.render();
 

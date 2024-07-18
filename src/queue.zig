@@ -5,14 +5,18 @@ pub fn Queue(comptime T: type) type {
         const Self = @This();
 
         items: std.ArrayList(T),
+        capacity: usize,
         mutex: std.Thread.Mutex,
         not_empty: std.Thread.Condition,
+        not_full: std.Thread.Condition,
 
         pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
             return Self{
                 .items = try std.ArrayList(T).initCapacity(allocator, capacity),
-                .mutex = std.Thread.Mutex{},
-                .not_empty = std.Thread.Condition{},
+                .mutex = .{},
+                .not_empty = .{},
+                .not_full = .{},
+                .capacity = capacity,
             };
         }
 
@@ -23,6 +27,10 @@ pub fn Queue(comptime T: type) type {
         pub fn push(self: *Self, item: T) !void {
             self.mutex.lock();
             defer self.mutex.unlock();
+
+            while (self.items.items.len >= self.capacity) {
+                self.not_full.wait(&self.mutex);
+            }
 
             try self.items.append(item);
             self.not_empty.signal();
@@ -36,6 +44,7 @@ pub fn Queue(comptime T: type) type {
                 self.not_empty.wait(&self.mutex);
             }
 
+            self.not_full.signal();
             return self.items.orderedRemove(0);
         }
 
